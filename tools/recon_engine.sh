@@ -278,10 +278,10 @@ if [ "$TARGET_TYPE" = "domain" ]; then
 
     # DNS wildcard detection (filters false positives from subdomain list)
     log_step "Checking for DNS wildcard..."
-    RANDOM_SUB="nonexistent-$(date +%s)-check.$TARGET"
-    WILDCARD_IP=$(dig +short "$RANDOM_SUB" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+    PROBE_SUB="nonexistent-$(date +%s)-${RANDOM}-check.$TARGET"
+    WILDCARD_IP=$(dig +short "$PROBE_SUB" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
     if [ -n "$WILDCARD_IP" ]; then
-        log_warn "DNS wildcard detected ($RANDOM_SUB → $WILDCARD_IP) — subdomain list may have false positives"
+        log_warn "DNS wildcard detected ($PROBE_SUB → $WILDCARD_IP) — subdomain list may have false positives"
         echo "$WILDCARD_IP" > "$RECON_DIR/dns/wildcard_ip.txt"
     else
         log_done "No DNS wildcard detected"
@@ -588,8 +588,11 @@ head -"$MAX_JS" "$RECON_DIR/js/all_js_urls.txt" | while IFS= read -r js_url; do
     SAFE=$(printf '%s' "$js_url" | md5sum | awk '{print $1}')
     curl -s --max-time 15 -A "Mozilla/5.0" "$js_url" 2>/dev/null \
         > "$RECON_DIR/js/downloaded/${SAFE}.js" || true
-    [ ! -s "$RECON_DIR/js/downloaded/${SAFE}.js" ] && rm -f "$RECON_DIR/js/downloaded/${SAFE}.js"
-    echo "$SAFE $js_url" >> "$RECON_DIR/js/file_map.txt"
+    if [ -s "$RECON_DIR/js/downloaded/${SAFE}.js" ]; then
+        echo "$SAFE $js_url" >> "$RECON_DIR/js/file_map.txt"
+    else
+        rm -f "$RECON_DIR/js/downloaded/${SAFE}.js"
+    fi
 done
 DOWNLOADED=$(find "$RECON_DIR/js/downloaded" -name "*.js" 2>/dev/null | wc -l || echo 0)
 log_done "Downloaded: $DOWNLOADED JS files"
@@ -626,8 +629,8 @@ endpoints = set()
 params    = set()
 
 PATH_PATTERNS = [
-    # Quoted relative/absolute paths with at least one slash
-    r'''["'`](/(?:api|v\d+|rest|gql|graphql|internal|admin|user|account|auth|oauth|token|service|data|config|upload|file|media|search|export|import|webhook|callback|health|status|metrics)[^\s"'`<>]{0,200})["'`]''',
+    # Quoted relative/absolute paths with at least one slash (bounded char class to avoid backtracking)
+    r'''["'`](/(?:api|v\d+|rest|gql|graphql|internal|admin|user|account|auth|oauth|token|service|data|config|upload|file|media|search|export|import|webhook|callback|health|status|metrics)[a-zA-Z0-9/_.-]{0,200})["'`]''',
     # Any quoted path 3+ segments deep
     r'''["'`](/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)*)["'`]''',
     # fetch / axios / XMLHttpRequest / http calls
@@ -669,11 +672,14 @@ for fname in os.listdir(js_dir):
     fpath = os.path.join(js_dir, fname)
     if not os.path.isfile(fpath):
         continue
-    # Handle source maps: extract original source file paths
+    # Handle source maps: extract original source file paths (cap at 500KB)
     if fname.endswith('.map'):
         try:
+            fsize = os.path.getsize(fpath)
+            if fsize > 500_000:
+                continue
             with open(fpath, 'r', errors='ignore') as f:
-                sm = json.loads(f.read(2_000_000))
+                sm = json.loads(f.read(500_000))
             for src in sm.get('sources', []):
                 if src and not src.startswith('webpack:'):
                     endpoints.add(f'[SOURCEMAP] {src}')
@@ -684,7 +690,7 @@ for fname in os.listdir(js_dir):
         continue
     try:
         with open(fpath, 'r', errors='ignore') as f:
-            content = f.read(2_000_000)
+            content = f.read(1_500_000)  # cap at 1.5MB per JS file
     except Exception:
         continue
 
@@ -774,7 +780,7 @@ for fname in os.listdir(js_dir):
     fpath = os.path.join(js_dir, fname)
     try:
         with open(fpath, 'r', errors='ignore') as f:
-            content = f.read(2_000_000)
+            content = f.read(1_500_000)  # cap at 1.5MB per file
     except Exception:
         continue
     for label, pattern in SECRET_PATTERNS:
@@ -824,18 +830,22 @@ fi
 if [ -s "$RECON_DIR/js/endpoints.txt" ] && [ -s "$RECON_DIR/live/urls.txt" ]; then
     log_step "Probing live status of API paths discovered in JS..."
     BASE_HOST=$(head -1 "$RECON_DIR/live/urls.txt" | awk '{print $1}')
-    grep -iE '^/(?:api|v[0-9]+|rest|internal)/' "$RECON_DIR/js/endpoints.txt" 2>/dev/null \
-        | grep -v '^\[SOURCEMAP\]' | sort -u | head -30 \
-        | while IFS= read -r path; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "${BASE_HOST}${path}" 2>/dev/null || echo "000")
-            if [ "$STATUS" != "404" ] && [ "$STATUS" != "000" ]; then
-                echo "[HTTP $STATUS] ${BASE_HOST}${path}" >> "$RECON_DIR/js/live_endpoints.txt"
-            fi
-        done
-    if [ -s "$RECON_DIR/js/live_endpoints.txt" ]; then
-        log_ok "Live JS-discovered endpoints: $(wc -l < "$RECON_DIR/js/live_endpoints.txt")"
+    if [ -n "$BASE_HOST" ] && echo "$BASE_HOST" | grep -qE '^https?://'; then
+        grep -iE '^/(?:api|v[0-9]+|rest|internal)/' "$RECON_DIR/js/endpoints.txt" 2>/dev/null \
+            | grep -v '^\[SOURCEMAP\]' | sort -u | head -30 \
+            | while IFS= read -r path; do
+                STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "${BASE_HOST}${path}" 2>/dev/null || echo "000")
+                if [ "$STATUS" != "404" ] && [ "$STATUS" != "000" ]; then
+                    echo "[HTTP $STATUS] ${BASE_HOST}${path}" >> "$RECON_DIR/js/live_endpoints.txt"
+                fi
+            done
+        if [ -s "$RECON_DIR/js/live_endpoints.txt" ]; then
+            log_ok "Live JS-discovered endpoints: $(wc -l < "$RECON_DIR/js/live_endpoints.txt")"
+        else
+            log_done "JS-discovered API paths: none returned live responses"
+        fi
     else
-        log_done "JS-discovered API paths: none returned live responses"
+        log_warn "BASE_HOST not valid — skipping live endpoint probing"
     fi
 fi
 
@@ -1112,7 +1122,7 @@ if command -v gh &>/dev/null && [ -n "$GH_ORGS" ]; then
         mkdir -p "$RECON_DIR/github/$org"
         for pattern in "${DORK_PATTERNS[@]}"; do
             RESULTS=$(gh search code "$pattern" --owner "$org" \
-                --json path,repository --limit 5 2>/dev/null || true)
+                --json path,repository --limit "${GH_SEARCH_LIMIT:-30}" 2>/dev/null || true)
             if [ -n "$RESULTS" ] && echo "$RESULTS" | grep -q '"path"'; then
                 echo "=== $pattern ===" >> "$RECON_DIR/github/$org/dorks.txt"
                 echo "$RESULTS" | python3 -c "
@@ -1384,7 +1394,7 @@ echo "  Screenshots:       $SCREENSHOTS"
 [ -f "$RECON_DIR/nuclei/all_findings.txt" ] && \
 echo "  Nuclei findings:   $(wc -l < "$RECON_DIR/nuclei/all_findings.txt" 2>/dev/null || echo 0)"
 [ -d "$RECON_DIR/cicd" ] && \
-echo "  CI/CD findings:    $(find "$RECON_DIR/cicd" -name 'scan_results.txt' -exec grep -c '\.github/workflows/' {} + 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')"
+echo "  CI/CD findings:    $(find "$RECON_DIR/cicd" -name 'scan_results.txt' -exec grep '\.github/workflows/' {} \; 2>/dev/null | wc -l || echo 0)"
 
 echo ""
 echo "  Results: $RECON_DIR/"

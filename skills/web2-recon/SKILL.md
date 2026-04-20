@@ -428,8 +428,9 @@ cat /tmp/live.txt | awk '{print $1}' | naabu -port 80,443,8080,8443,3000,4000,50
 
 ```bash
 # trufflehog v3 — high-signal, verified secrets, no false positives
+# WARNING: output contains live secret values — do not share terminal or log files
 trufflehog filesystem recon/$TARGET/js/downloaded/ --only-verified --no-update --json \
-  | jq -r '[.DetectorName, .Raw] | @tsv'
+  | jq -r '[.DetectorName, (.Raw | .[0:20] + "...")] | @tsv'  # truncate secret in output
 
 # Quick grep for high-value patterns in downloaded JS
 grep -rn "AKIA[0-9A-Z]\{16\}"     recon/$TARGET/js/downloaded/  # AWS Access Key
