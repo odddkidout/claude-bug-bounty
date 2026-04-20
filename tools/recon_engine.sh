@@ -532,39 +532,314 @@ else
 fi
 
 # ============================================================
-# Phase 5: JS Analysis
+# Phase 5: JavaScript Analysis (Deep)
 # ============================================================
 echo ""
-log_info "Phase 5: JavaScript Analysis"
+log_info "Phase 5: JavaScript Analysis (Deep)"
 
-if [ -s "$RECON_DIR/urls/js_files.txt" ]; then
-    log_step "Extracting endpoints from JS files (top 50)..."
-    mkdir -p "$RECON_DIR/js"
+mkdir -p "$RECON_DIR/js/downloaded"
 
-    head -50 "$RECON_DIR/urls/js_files.txt" | while IFS= read -r js_url; do
-        curl -s --max-time 10 "$js_url" 2>/dev/null | \
-            sed -nE 's/.*["'"'"']([a-zA-Z0-9_/.-]*(\/[a-zA-Z0-9_/.-]+)+)["'"'"'].*/\1/p' \
-            >> "$RECON_DIR/js/endpoints_raw.txt" 2>/dev/null || true
-    done
-
-    if [ -f "$RECON_DIR/js/endpoints_raw.txt" ]; then
-        sort -u "$RECON_DIR/js/endpoints_raw.txt" > "$RECON_DIR/js/endpoints.txt"
-        log_done "JS endpoints: $(wc -l < "$RECON_DIR/js/endpoints.txt" 2>/dev/null || echo 0)"
-
-        # Extract potential secrets from JS
-        head -50 "$RECON_DIR/urls/js_files.txt" | while IFS= read -r js_url; do
-            curl -s --max-time 10 "$js_url" 2>/dev/null | \
-                grep -oiE '(api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|client[_-]?secret|password|secret[_-]?key)["\s]*[:=]["\s]*[a-zA-Z0-9_\-]{8,}' \
-                >> "$RECON_DIR/js/potential_secrets.txt" 2>/dev/null || true
-        done
-        if [ -s "$RECON_DIR/js/potential_secrets.txt" ]; then
-            sort -u "$RECON_DIR/js/potential_secrets.txt" -o "$RECON_DIR/js/potential_secrets.txt"
-            log_warn "Potential secrets found in JS: $(wc -l < "$RECON_DIR/js/potential_secrets.txt")"
-        fi
+# ── Step 5a: JS file discovery from live hosts ──────────────────────────────
+# Finds JS bundles that never appeared in historical URL data
+if [ -s "$RECON_DIR/live/urls.txt" ]; then
+    if command -v katana &>/dev/null; then
+        log_step "Crawling live hosts for JS files (katana -jc)..."
+        katana -list "$RECON_DIR/live/urls.txt" \
+            -jc -d 2 -silent \
+            -extension-match js \
+            -o "$RECON_DIR/js/katana_js.txt" 2>/dev/null || true
+        cat "$RECON_DIR/js/katana_js.txt" "$RECON_DIR/urls/js_files.txt" 2>/dev/null \
+            | sort -u > "$RECON_DIR/js/all_js_urls.txt" || true
+        log_done "katana extra JS: $(wc -l < "$RECON_DIR/js/katana_js.txt" 2>/dev/null || echo 0)"
+    else
+        # Fallback: scrape <script src="..."> tags from live host HTML
+        log_step "Scraping <script src> tags (katana not installed)..."
+        head -20 "$RECON_DIR/live/urls.txt" | while IFS= read -r url; do
+            BASE_HOST=$(echo "$url" | grep -oE 'https?://[^/]+')
+            curl -s --max-time 10 "$url" 2>/dev/null \
+                | grep -oiE 'src="([^"]*\.js[^"]*)"' \
+                | sed -E 's/src="([^"]*)"/\1/' \
+                | while IFS= read -r js_path; do
+                    if echo "$js_path" | grep -qE '^https?://'; then
+                        echo "$js_path"
+                    else
+                        echo "${BASE_HOST}${js_path}"
+                    fi
+                done
+        done | sort -u >> "$RECON_DIR/urls/js_files.txt" 2>/dev/null || true
+        sort -u "$RECON_DIR/urls/js_files.txt" -o "$RECON_DIR/urls/js_files.txt" 2>/dev/null || true
+        cp "$RECON_DIR/urls/js_files.txt" "$RECON_DIR/js/all_js_urls.txt" 2>/dev/null || true
     fi
 else
-    log_warn "No JS files found — skipping JS analysis"
+    cp "$RECON_DIR/urls/js_files.txt" "$RECON_DIR/js/all_js_urls.txt" 2>/dev/null || true
 fi
+
+JS_TOTAL=$(wc -l < "$RECON_DIR/js/all_js_urls.txt" 2>/dev/null || echo 0)
+log_done "Total JS files to analyze: $JS_TOTAL"
+
+if [ "$JS_TOTAL" -eq 0 ]; then
+    log_warn "No JS files found — skipping JS deep analysis"
+else
+
+MAX_JS=$([ "$QUICK_MODE" = "--quick" ] && echo 30 || echo 100)
+log_step "Downloading top $MAX_JS JS files..."
+
+head -"$MAX_JS" "$RECON_DIR/js/all_js_urls.txt" | while IFS= read -r js_url; do
+    SAFE=$(printf '%s' "$js_url" | md5sum | awk '{print $1}')
+    curl -s --max-time 15 -A "Mozilla/5.0" "$js_url" 2>/dev/null \
+        > "$RECON_DIR/js/downloaded/${SAFE}.js" || true
+    [ ! -s "$RECON_DIR/js/downloaded/${SAFE}.js" ] && rm -f "$RECON_DIR/js/downloaded/${SAFE}.js"
+    echo "$SAFE $js_url" >> "$RECON_DIR/js/file_map.txt"
+done
+DOWNLOADED=$(find "$RECON_DIR/js/downloaded" -name "*.js" 2>/dev/null | wc -l || echo 0)
+log_done "Downloaded: $DOWNLOADED JS files"
+
+# ── Step 5b: Source map extraction ──────────────────────────────────────────
+# .js.map files expose original (unminified) source — massive recon win
+log_step "Checking for exposed source maps (.js.map)..."
+head -"$MAX_JS" "$RECON_DIR/js/all_js_urls.txt" | while IFS= read -r js_url; do
+    MAP_URL="${js_url}.map"
+    STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$MAP_URL" 2>/dev/null || echo "000")
+    if [ "$STATUS" = "200" ]; then
+        log_warn "Source map exposed: $MAP_URL"
+        echo "$MAP_URL" >> "$RECON_DIR/js/source_maps.txt"
+        SAFE=$(printf '%s' "$MAP_URL" | md5sum | awk '{print $1}')
+        curl -s --max-time 15 "$MAP_URL" 2>/dev/null \
+            > "$RECON_DIR/js/downloaded/${SAFE}.map" || true
+    fi
+done
+if [ -s "$RECON_DIR/js/source_maps.txt" ]; then
+    log_warn "Source maps: $(wc -l < "$RECON_DIR/js/source_maps.txt") found — original source may be recoverable"
+else
+    log_done "No source maps found"
+fi
+
+# ── Step 5c: Deep endpoint, hidden URL, and hidden parameter extraction ──────
+log_step "Extracting hidden endpoints + parameters from JS (Python deep scan)..."
+python3 - "$RECON_DIR/js/downloaded" "$RECON_DIR/js" <<'PY'
+import os, re, sys, json
+
+js_dir  = sys.argv[1]
+out_dir = sys.argv[2]
+
+endpoints = set()
+params    = set()
+
+PATH_PATTERNS = [
+    # Quoted relative/absolute paths with at least one slash
+    r'''["'`](/(?:api|v\d+|rest|gql|graphql|internal|admin|user|account|auth|oauth|token|service|data|config|upload|file|media|search|export|import|webhook|callback|health|status|metrics)[^\s"'`<>]{0,200})["'`]''',
+    # Any quoted path 3+ segments deep
+    r'''["'`](/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)*)["'`]''',
+    # fetch / axios / XMLHttpRequest / http calls
+    r'''(?:fetch|axios\.(?:get|post|put|patch|delete|head|options)|(?:new\s+)?XMLHttpRequest|http\.(?:get|post|put|delete|patch))\s*[.(]\s*["'`]([^"'`\s]{5,})["'`]''',
+    # Template literal API paths
+    r'''`(/(?:api|v\d+|rest|gql)[^`\s]{2,})`''',
+    # Router.navigate / history.push / window.location assignments
+    r'''(?:navigate|\.push|\.replace|\.assign|location\.href\s*=)\s*["'`](/[^"'`\s]{3,})["'`]''',
+    # Express/Koa/Hapi route definitions leaking into bundles
+    r'''(?:router|app|server)\.(?:get|post|put|patch|delete|use)\s*\(\s*["'`](/[^"'`\s]{2,})["'`]''',
+]
+
+PARAM_PATTERNS = [
+    # JSON object keys in fetch/axios body literals
+    r'''[{,]\s*["'`]([a-zA-Z_][a-zA-Z0-9_]{1,40})["'`]\s*:''',
+    # FormData.append / URLSearchParams.set|append
+    r'''\.(?:append|set)\s*\(\s*["'`]([a-zA-Z_][a-zA-Z0-9_]{1,40})["'`]''',
+    # Query-string params embedded in string literals
+    r'''[?&]([a-zA-Z_][a-zA-Z0-9_]{1,40})=''',
+    # Object destructuring that looks like API field names
+    r'''const\s*\{\s*([a-zA-Z_][a-zA-Z0-9_]{1,40})\s*\}''',
+]
+
+BLACKLIST_PATHS = {
+    '//', '/', '/index', '/en', '/us', '/static', '/assets',
+    '/img', '/css', '/js', '/fonts', '/images', '/favicon.ico',
+}
+BLACKLIST_PARAMS = {
+    'true', 'false', 'null', 'undefined', 'function', 'return',
+    'const', 'let', 'var', 'class', 'this', 'super', 'import',
+    'export', 'default', 'from', 'new', 'if', 'else', 'for',
+    'while', 'try', 'catch', 'throw', 'type', 'name', 'key',
+    'value', 'id', 'src', 'href', 'class', 'style', 'data',
+    'props', 'state', 'event', 'error', 'result', 'response',
+    'index', 'item', 'items', 'list', 'children', 'parent',
+}
+
+for fname in os.listdir(js_dir):
+    fpath = os.path.join(js_dir, fname)
+    if not os.path.isfile(fpath):
+        continue
+    # Handle source maps: extract original source file paths
+    if fname.endswith('.map'):
+        try:
+            with open(fpath, 'r', errors='ignore') as f:
+                sm = json.loads(f.read(2_000_000))
+            for src in sm.get('sources', []):
+                if src and not src.startswith('webpack:'):
+                    endpoints.add(f'[SOURCEMAP] {src}')
+        except Exception:
+            pass
+        continue
+    if not fname.endswith('.js'):
+        continue
+    try:
+        with open(fpath, 'r', errors='ignore') as f:
+            content = f.read(2_000_000)
+    except Exception:
+        continue
+
+    for pattern in PATH_PATTERNS:
+        for m in re.finditer(pattern, content, re.IGNORECASE):
+            path = m.group(1).split('?')[0].rstrip('/')
+            if (len(path) > 3
+                    and path not in BLACKLIST_PATHS
+                    and not re.match(r'^/[0-9a-f]{8,}$', path)
+                    and re.search(r'[a-zA-Z]', path)):
+                endpoints.add(path)
+
+    for pattern in PARAM_PATTERNS:
+        for m in re.finditer(pattern, content):
+            p = m.group(1)
+            if p not in BLACKLIST_PARAMS and len(p) > 1:
+                params.add(p)
+
+with open(os.path.join(out_dir, 'endpoints.txt'), 'w') as f:
+    for e in sorted(endpoints):
+        f.write(e + '\n')
+
+with open(os.path.join(out_dir, 'hidden_params.txt'), 'w') as f:
+    for p in sorted(params):
+        f.write(p + '\n')
+
+print(f'endpoints:{len(endpoints)}')
+print(f'params:{len(params)}')
+PY
+
+JS_ENDPOINTS=$(wc -l < "$RECON_DIR/js/endpoints.txt" 2>/dev/null || echo 0)
+JS_PARAMS=$(wc -l < "$RECON_DIR/js/hidden_params.txt" 2>/dev/null || echo 0)
+log_done "JS hidden endpoints:  $JS_ENDPOINTS"
+log_done "JS hidden parameters: $JS_PARAMS"
+if [ "$JS_PARAMS" -gt 0 ]; then
+    log_step "Sample params: $(head -10 "$RECON_DIR/js/hidden_params.txt" | tr '\n' ', ')"
+fi
+
+# ── Step 5d: Comprehensive secret scanning (30+ pattern types) ───────────────
+log_step "Scanning JS files for secrets (30+ pattern types)..."
+python3 - "$RECON_DIR/js/downloaded" "$RECON_DIR/js/secrets.txt" <<'PY'
+import os, re, sys
+
+js_dir = sys.argv[1]
+out_f  = sys.argv[2]
+
+SECRET_PATTERNS = [
+    ("AWS Access Key ID",    r'AKIA[0-9A-Z]{16}'),
+    ("AWS Secret Key",       r'(?i)aws[_\-]?secret[_\-]?(?:access[_\-]?)?key["\'`]?\s*[:=]\s*["\'`]?([A-Za-z0-9/+]{40})'),
+    ("Google API Key",       r'AIza[0-9A-Za-z\-_]{35}'),
+    ("GCP Service Account",  r'"type"\s*:\s*"service_account"'),
+    ("GitHub Token",         r'gh[pousr]_[A-Za-z0-9_]{36,255}|github_pat_[A-Za-z0-9_]{82}'),
+    ("GitLab Token",         r'glpat-[0-9a-zA-Z\-]{20}'),
+    ("Slack Token",          r'xox[baprs]-[0-9A-Za-z\-]+'),
+    ("Slack Webhook",        r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}'),
+    ("Stripe Live Key",      r'sk_live_[0-9a-zA-Z]{24,}'),
+    ("Stripe Publishable",   r'pk_live_[0-9a-zA-Z]{24,}'),
+    ("SendGrid Key",         r'SG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}'),
+    ("Twilio Key",           r'SK[0-9a-fA-F]{32}'),
+    ("JWT Token",            r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'),
+    ("RSA Private Key",      r'-----BEGIN RSA PRIVATE KEY-----'),
+    ("Private Key",          r'-----BEGIN (?:EC |DSA |OPENSSH |PGP )?PRIVATE KEY'),
+    ("Firebase Realtime DB", r'https://[a-z0-9-]+\.firebaseio\.com'),
+    ("Firebase API Key",     r'(?i)firebase[_\-]?api[_\-]?key["\'`]?\s*[:=]\s*["\'`]?([A-Za-z0-9\-_]{20,})'),
+    ("Heroku API Key",       r'(?i)heroku.*[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}'),
+    ("Auth0 Secret",         r'(?i)auth0.*(?:secret|token)["\'`]?\s*[:=]\s*["\'`]?([A-Za-z0-9\-_]{20,})'),
+    ("Bearer Token",         r'[Bb]earer [A-Za-z0-9\-._~+/]{20,}'),
+    ("Basic Auth Header",    r'(?i)Authorization["\'`]?\s*[:=]\s*["\'`]?Basic [A-Za-z0-9+/=]{16,}'),
+    ("Password in JS",       r'(?i)(?:password|passwd|pwd)["\'`]?\s*[:=]\s*["\'`]([^"\'`\s]{8,})["\'`]'),
+    ("API Key Generic",      r'(?i)api[_\-]?key["\'`]?\s*[:=]\s*["\'`]([A-Za-z0-9\-_]{16,})["\'`]'),
+    ("Secret Generic",       r'(?i)(?:app|client|oauth|hmac)?[_\-]?secret["\'`]?\s*[:=]\s*["\'`]([A-Za-z0-9\-_]{16,})["\'`]'),
+    ("Access Token",         r'(?i)access[_\-]?token["\'`]?\s*[:=]\s*["\'`]([A-Za-z0-9\-_.]{16,})["\'`]'),
+    ("Client Secret",        r'(?i)client[_\-]?secret["\'`]?\s*[:=]\s*["\'`]([A-Za-z0-9\-_]{16,})["\'`]'),
+    ("Encryption Key",       r'(?i)encryption[_\-]?key["\'`]?\s*[:=]\s*["\'`]([A-Za-z0-9\-_+/=]{16,})["\'`]'),
+    ("NPM Token",            r'npm_[A-Za-z0-9]{36}'),
+    ("Mailgun Key",          r'key-[0-9a-zA-Z]{32}'),
+    ("Square Token",         r'sq0atp-[0-9A-Za-z\-_]{22}|sq0csp-[0-9A-Za-z\-_]{43}'),
+    ("Internal IP URL",      r'https?://(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.|127\.0\.0\.1)[^\s"\'`<>]+'),
+    ("Admin Path",           r'["\'`](/(?:admin|internal|debug|console|manage|staff|superuser|backdoor|_debug|_admin)[^\s"\'`<>]*)["\'`]'),
+    ("Hardcoded Subdomain",  r'["\'`](https?://(?:dev|staging|uat|test|qa|internal|corp|api-internal)[^\s"\'`<>]{5,})["\'`]'),
+]
+
+hits = []
+for fname in os.listdir(js_dir):
+    if not fname.endswith('.js'):
+        continue
+    fpath = os.path.join(js_dir, fname)
+    try:
+        with open(fpath, 'r', errors='ignore') as f:
+            content = f.read(2_000_000)
+    except Exception:
+        continue
+    for label, pattern in SECRET_PATTERNS:
+        for m in re.finditer(pattern, content):
+            snippet = m.group(0)[:140].replace('\n', ' ')
+            hits.append(f'[{label}] {snippet}')
+
+# Deduplicate by first 60 chars of snippet
+seen, unique = set(), []
+for h in hits:
+    key = h[:60]
+    if key not in seen:
+        seen.add(key)
+        unique.append(h)
+
+with open(out_f, 'w') as f:
+    for h in sorted(unique):
+        f.write(h + '\n')
+
+print(f'secrets:{len(unique)}')
+PY
+
+SECRET_COUNT=$(wc -l < "$RECON_DIR/js/secrets.txt" 2>/dev/null || echo 0)
+if [ "$SECRET_COUNT" -gt 0 ]; then
+    log_warn "Potential secrets in JS: $SECRET_COUNT — review $RECON_DIR/js/secrets.txt"
+    head -5 "$RECON_DIR/js/secrets.txt" | while IFS= read -r line; do log_step "$line"; done
+else
+    log_done "No secrets found in JS files"
+fi
+
+# ── Step 5e: trufflehog (if installed — verified high-signal secrets) ────────
+if command -v trufflehog &>/dev/null; then
+    log_step "Running trufflehog on downloaded JS (verified secrets only)..."
+    trufflehog filesystem "$RECON_DIR/js/downloaded/" \
+        --only-verified \
+        --no-update \
+        --json 2>/dev/null \
+        | head -200 > "$RECON_DIR/js/trufflehog.json" || true
+    if [ -s "$RECON_DIR/js/trufflehog.json" ]; then
+        log_warn "trufflehog verified secrets: $(wc -l < "$RECON_DIR/js/trufflehog.json")"
+    else
+        log_done "trufflehog: no verified secrets"
+    fi
+fi
+
+# ── Step 5f: Probe live status of JS-discovered API endpoints ─────────────────
+if [ -s "$RECON_DIR/js/endpoints.txt" ] && [ -s "$RECON_DIR/live/urls.txt" ]; then
+    log_step "Probing live status of API paths discovered in JS..."
+    BASE_HOST=$(head -1 "$RECON_DIR/live/urls.txt" | awk '{print $1}')
+    grep -iE '^/(?:api|v[0-9]+|rest|internal)/' "$RECON_DIR/js/endpoints.txt" 2>/dev/null \
+        | grep -v '^\[SOURCEMAP\]' | sort -u | head -30 \
+        | while IFS= read -r path; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "${BASE_HOST}${path}" 2>/dev/null || echo "000")
+            if [ "$STATUS" != "404" ] && [ "$STATUS" != "000" ]; then
+                echo "[HTTP $STATUS] ${BASE_HOST}${path}" >> "$RECON_DIR/js/live_endpoints.txt"
+            fi
+        done
+    if [ -s "$RECON_DIR/js/live_endpoints.txt" ]; then
+        log_ok "Live JS-discovered endpoints: $(wc -l < "$RECON_DIR/js/live_endpoints.txt")"
+    else
+        log_done "JS-discovered API paths: none returned live responses"
+    fi
+fi
+
+fi  # end JS_TOTAL > 0
 
 # ============================================================
 # Phase 6: Directory Fuzzing
@@ -1067,23 +1342,49 @@ echo "  Completed: $(date)"
 echo "============================================="
 echo ""
 echo "  Subdomains:        $(wc -l < "$RECON_DIR/subdomains/all.txt" 2>/dev/null || echo 0)"
+[ -f "$RECON_DIR/asn/cidrs.txt" ] && \
+echo "  ASN CIDRs:         $(wc -l < "$RECON_DIR/asn/cidrs.txt" 2>/dev/null || echo 0)"
 [ -f "$RECON_DIR/live/urls.txt" ] && \
 echo "  Live hosts:        $(wc -l < "$RECON_DIR/live/urls.txt" 2>/dev/null || echo 0)"
 [ -f "$RECON_DIR/ports/open_ports.txt" ] && \
 echo "  Open ports:        $(wc -l < "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || echo 0)"
+[ -f "$RECON_DIR/waf/detected.txt" ] || [ -f "$RECON_DIR/waf/wafw00f.txt" ] && \
+echo "  WAF detected:      $(cat "$RECON_DIR/waf/detected.txt" "$RECON_DIR/waf/wafw00f.txt" 2>/dev/null | wc -l || echo 0) hosts"
 [ -f "$RECON_DIR/urls/all.txt" ] && \
 echo "  URLs collected:    $(wc -l < "$RECON_DIR/urls/all.txt" 2>/dev/null || echo 0)"
+[ -f "$RECON_DIR/urls/new_endpoints.txt" ] && \
+echo "  New endpoints:     $(wc -l < "$RECON_DIR/urls/new_endpoints.txt" 2>/dev/null || echo 0) (recently deployed — high priority)"
 [ -f "$RECON_DIR/urls/with_params.txt" ] && \
 echo "  Parameterized:     $(wc -l < "$RECON_DIR/urls/with_params.txt" 2>/dev/null || echo 0)"
 [ -f "$RECON_DIR/urls/api_endpoints.txt" ] && \
 echo "  API endpoints:     $(wc -l < "$RECON_DIR/urls/api_endpoints.txt" 2>/dev/null || echo 0)"
+[ -f "$RECON_DIR/js/all_js_urls.txt" ] && \
+echo "  JS files:          $(wc -l < "$RECON_DIR/js/all_js_urls.txt" 2>/dev/null || echo 0) discovered / $(find "$RECON_DIR/js/downloaded" -name "*.js" 2>/dev/null | wc -l || echo 0) downloaded"
 [ -f "$RECON_DIR/js/endpoints.txt" ] && \
 echo "  JS endpoints:      $(wc -l < "$RECON_DIR/js/endpoints.txt" 2>/dev/null || echo 0)"
+[ -f "$RECON_DIR/js/hidden_params.txt" ] && \
+echo "  JS hidden params:  $(wc -l < "$RECON_DIR/js/hidden_params.txt" 2>/dev/null || echo 0)"
+[ -f "$RECON_DIR/js/secrets.txt" ] && [ -s "$RECON_DIR/js/secrets.txt" ] && \
+echo "  JS secrets:        $(wc -l < "$RECON_DIR/js/secrets.txt" 2>/dev/null || echo 0) potential hits  ← REVIEW"
+[ -f "$RECON_DIR/js/source_maps.txt" ] && [ -s "$RECON_DIR/js/source_maps.txt" ] && \
+echo "  Source maps:       $(wc -l < "$RECON_DIR/js/source_maps.txt" 2>/dev/null || echo 0)  ← REVIEW (original source exposed)"
 [ -f "$RECON_DIR/params/unique_params.txt" ] && \
 echo "  Unique params:     $(wc -l < "$RECON_DIR/params/unique_params.txt" 2>/dev/null || echo 0)"
-
+[ -f "$RECON_DIR/graphql/introspection_enabled.txt" ] && [ -s "$RECON_DIR/graphql/introspection_enabled.txt" ] && \
+echo "  GraphQL open:      $(wc -l < "$RECON_DIR/graphql/introspection_enabled.txt" 2>/dev/null || echo 0) endpoint(s)  ← REVIEW"
+[ -f "$RECON_DIR/takeover/dangling_cnames.txt" ] && [ -s "$RECON_DIR/takeover/dangling_cnames.txt" ] && \
+echo "  Takeover leads:    $(wc -l < "$RECON_DIR/takeover/dangling_cnames.txt" 2>/dev/null || echo 0)  ← REVIEW"
+[ -f "$RECON_DIR/cloud/buckets.txt" ] && [ -s "$RECON_DIR/cloud/buckets.txt" ] && \
+echo "  Cloud assets:      $(wc -l < "$RECON_DIR/cloud/buckets.txt" 2>/dev/null || echo 0)  ← REVIEW"
+[ -f "$RECON_DIR/github/exposed_git.txt" ] && [ -s "$RECON_DIR/github/exposed_git.txt" ] && \
+echo "  Exposed .git:      $(wc -l < "$RECON_DIR/github/exposed_git.txt" 2>/dev/null || echo 0)  ← REVIEW"
+SCREENSHOTS=$(find "$RECON_DIR/screenshots" -name "*.png" 2>/dev/null | wc -l || echo 0)
+[ "$SCREENSHOTS" -gt 0 ] && \
+echo "  Screenshots:       $SCREENSHOTS"
+[ -f "$RECON_DIR/nuclei/all_findings.txt" ] && \
+echo "  Nuclei findings:   $(wc -l < "$RECON_DIR/nuclei/all_findings.txt" 2>/dev/null || echo 0)"
 [ -d "$RECON_DIR/cicd" ] && \
-echo "  CI/CD findings:   $(find "$RECON_DIR/cicd" -name 'scan_results.txt' -exec grep -cP '\.github/workflows/' {} + 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')"
+echo "  CI/CD findings:    $(find "$RECON_DIR/cicd" -name 'scan_results.txt' -exec grep -c '\.github/workflows/' {} + 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')"
 
 echo ""
 echo "  Results: $RECON_DIR/"

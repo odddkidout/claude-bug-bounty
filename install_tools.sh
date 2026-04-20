@@ -47,6 +47,8 @@ BREW_TOOLS=(
     "nuclei"
     "ffuf"
     "amass"
+    "wafw00f"
+    "trufflehog"
 )
 
 echo ""
@@ -72,12 +74,14 @@ GO_TOOLS=(
     "github.com/lc/gau/v2/cmd/gau@latest"
     "github.com/hahwul/dalfox/v2@latest"
     "github.com/haccer/subjack@latest"
+    "github.com/sensepost/gowitness/v3@latest"
 )
 
 GO_TOOL_NAMES=(
     "gau"
     "dalfox"
     "subjack"
+    "gowitness"
 )
 
 for i in "${!GO_TOOLS[@]}"; do
@@ -183,7 +187,7 @@ echo "============================================="
 echo "[*] Installation Verification"
 echo "============================================="
 
-ALL_TOOLS=(subfinder httpx nuclei ffuf nmap amass gau dalfox subjack sisakulint)
+ALL_TOOLS=(subfinder httpx nuclei ffuf nmap amass gau dalfox subjack gowitness wafw00f trufflehog sisakulint)
 INSTALLED=0
 MISSING=0
 

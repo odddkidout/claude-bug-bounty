@@ -147,39 +147,119 @@ cat /tmp/urls.txt | gf rce | tee /tmp/rce-candidates.txt
 
 ---
 
-## JS ANALYSIS
+## JS ANALYSIS — DEEP SCAN (HIGH GOLD CONTENT)
 
-### SecretFinder (API keys, tokens in JS bundles)
+JavaScript bundles are the single highest-yield recon target. Minified JS hides API routes, parameter names, secrets, internal hostnames, and auth logic that never appear in any other recon source.
+
+### Step 1 — Discover ALL JS Files (not just from historical data)
 
 ```bash
-# Activate venv
-source ~/tools/SecretFinder/.venv/bin/activate
+# katana finds dynamically loaded chunks that gau/wayback miss
+katana -list /tmp/live.txt -jc -d 2 -silent -extension-match js \
+  > /tmp/js-urls.txt
 
-# Scan a single JS file
-python3 ~/tools/SecretFinder/SecretFinder.py -i "https://target.com/static/js/main.js" -o cli
+# Fallback: scrape <script src> tags directly
+while read url; do
+  BASE=$(echo $url | grep -oE 'https?://[^/]+')
+  curl -s --max-time 10 "$url" \
+    | grep -oiE 'src="([^"]*\.js[^"]*)"' \
+    | sed -E 's/src="([^"]*)"/\1/' \
+    | sed "s|^/|${BASE}/|"
+done < /tmp/live.txt | sort -u >> /tmp/js-urls.txt
 
-# Scan all JS URLs found in recon
-cat /tmp/urls.txt | grep "\.js$" | head -50 | while read url; do
-  echo "=== $url ==="
-  python3 ~/tools/SecretFinder/SecretFinder.py -i "$url" -o cli 2>/dev/null
+echo "[+] JS files: $(wc -l < /tmp/js-urls.txt)"
+```
+
+### Step 2 — Check for Source Maps (.js.map)
+
+Source maps expose the **original unminified source** of the entire frontend app.
+
+```bash
+cat /tmp/js-urls.txt | while read url; do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${url}.map")
+  [ "$STATUS" = "200" ] && echo "[SOURCE MAP EXPOSED] ${url}.map"
+done
+```
+
+If found: download the `.map` file and run `source-map-unpack` or just read the `sources` array — it lists original filenames and often includes route definitions, auth logic, and internal API paths.
+
+### Step 3 — Deep Endpoint + Hidden Parameter Extraction
+
+**What to look for in JS:**
+- `fetch('/api/v2/admin/users')` — hidden admin endpoints
+- `axios.post('/internal/payment/refund')` — internal API calls  
+- `FormData.append('role', ...)` — hidden parameters
+- `?debug=true&bypass=1` — query params embedded in test code
+- `router.get('/api/legacy/v1/...)` — old versioned routes still compiled in
+
+```bash
+# Download top 100 JS files
+mkdir -p /tmp/js-files
+head -100 /tmp/js-urls.txt | while read url; do
+  SAFE=$(echo $url | md5sum | awk '{print $1}')
+  curl -s --max-time 15 -A "Mozilla/5.0" "$url" > /tmp/js-files/${SAFE}.js
 done
 
-deactivate
+# Python deep scan (built into recon_engine.sh Phase 5)
+# Extracts: API paths, fetch/axios calls, router definitions,
+#           FormData keys, URLSearchParams, query string params
 ```
 
-### LinkFinder (Endpoints hidden in JS)
+### Step 4 — Comprehensive Secret Scanning (30+ patterns)
 
 ```bash
-source ~/tools/LinkFinder/.venv/bin/activate
+# Built into recon_engine.sh Phase 5 — checks for:
+# AWS Access Key / Secret, Google API Key, GitHub/GitLab tokens,
+# Slack tokens, Stripe keys, SendGrid, Twilio, JWT tokens,
+# RSA private keys, Firebase URLs, Heroku keys, Auth0 secrets,
+# Bearer tokens, hardcoded passwords, NPM tokens, Mailgun,
+# Internal IP URLs, admin path strings
 
-# Single JS file
-python3 ~/tools/LinkFinder/linkfinder.py -i "https://target.com/app.js" -o cli
-
-# All pages (crawls JS from HTML)
-python3 ~/tools/LinkFinder/linkfinder.py -i "https://target.com" -d -o cli
-
-deactivate
+# Manual grep supplement:
+grep -rn "AKIA" /tmp/js-files/                              # AWS key
+grep -rn "eyJ" /tmp/js-files/ | head -20                   # JWT
+grep -rn "sk_live_" /tmp/js-files/                         # Stripe
+grep -rn "xox" /tmp/js-files/                              # Slack
+grep -rn "firebaseio" /tmp/js-files/                       # Firebase
+grep -rn "192\.168\.\|10\.\|172\.1[6-9]\." /tmp/js-files/ # Internal IPs
+grep -riE "password\s*[:=]\s*['\"][^'\"]{8,}" /tmp/js-files/ # Hardcoded passwords
 ```
+
+### Step 5 — trufflehog (High-Signal Verified Secrets)
+
+```bash
+# trufflehog v3 — only reports secrets it can verify as active
+trufflehog filesystem /tmp/js-files/ --only-verified --no-update --json
+
+# Pipe to jq for readable output:
+trufflehog filesystem /tmp/js-files/ --only-verified --no-update --json \
+  | jq -r '[.DetectorName, .SourceMetadata.Data.Filesystem.file, .Raw] | @tsv'
+```
+
+### Step 6 — Probe Live Status of JS-Discovered API Endpoints
+
+```bash
+# Take paths found in JS and check if they're actually live
+BASE="https://target.com"
+grep -iE '^/api/|^/v[0-9]+/' /tmp/js-endpoints.txt | sort -u | head -30 | while read path; do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "${BASE}${path}")
+  [ "$STATUS" != "404" ] && [ "$STATUS" != "000" ] && echo "[HTTP $STATUS] ${BASE}${path}"
+done
+```
+
+### JS Gold — What to Do When You Find It
+
+| Finding | Action |
+|---|---|
+| **Source map exposed** | Download → read `sources[]` array → look for route files, auth middleware |
+| **Admin endpoint in JS** | Try it unauthenticated first, then with a low-priv token |
+| **Internal IP in JS** | SSRF target — use in `url=`, `redirect=`, `callback=` params |
+| **AWS key in JS** | Run `aws sts get-caller-identity` to verify it's live, then enumerate permissions |
+| **Firebase URL in JS** | Try `https://<name>.firebaseio.com/.json` — open = full database read |
+| **JWT in JS** | Decode payload, look for algorithm, try `alg: none` bypass |
+| **Hidden parameter** | Replay requests with that param, test for injection + IDOR |
+| **Old API version** | `/api/v1/` when app uses `/api/v3/` — often no auth, no rate limits |
+| **Hardcoded password** | Try on login page and all subdomains |
 
 ---
 
@@ -347,21 +427,22 @@ cat /tmp/live.txt | awk '{print $1}' | naabu -port 80,443,8080,8443,3000,4000,50
 ## SECRET SCANNING IN JS BUNDLES
 
 ```bash
-# trufflehog — high-signal secret detection with entropy analysis
-# Scans JS files and git repos
-pip install trufflehog3 2>/dev/null || true
-trufflehog filesystem --only-verified recon/$TARGET/ 2>/dev/null
+# trufflehog v3 — high-signal, verified secrets, no false positives
+trufflehog filesystem recon/$TARGET/js/downloaded/ --only-verified --no-update --json \
+  | jq -r '[.DetectorName, .Raw] | @tsv'
 
-# SecretFinder — manual JS bundle scan (already in tools/)
-source ~/tools/SecretFinder/.venv/bin/activate
-cat /tmp/urls.txt | grep "\.js$" | head -100 | while read url; do
-  python3 ~/tools/SecretFinder/SecretFinder.py -i "$url" -o cli 2>/dev/null
-done
-deactivate
+# Quick grep for high-value patterns in downloaded JS
+grep -rn "AKIA[0-9A-Z]\{16\}"     recon/$TARGET/js/downloaded/  # AWS Access Key
+grep -rn "sk_live_"               recon/$TARGET/js/downloaded/  # Stripe live key
+grep -rn "xoxb-\|xoxa-\|xoxp-"   recon/$TARGET/js/downloaded/  # Slack tokens
+grep -rn "gh[pousr]_"             recon/$TARGET/js/downloaded/  # GitHub tokens
+grep -rn "eyJ"                    recon/$TARGET/js/downloaded/  # JWT tokens
+grep -rn "firebaseio\.com"        recon/$TARGET/js/downloaded/  # Firebase
+grep -rn "192\.168\.\|10\.\|172\." recon/$TARGET/js/downloaded/ # Internal IPs
 
-# Quick grep for common patterns in downloaded JS
-wget -q -r -l 1 -A "*.js" -P /tmp/js-files/ "https://$TARGET" 2>/dev/null
-grep -rn "api_key\|apiKey\|client_secret\|access_token\|private_key\|AWS_SECRET\|AKIA" /tmp/js-files/ 2>/dev/null
+# Also check the recon_engine.sh Phase 5 output:
+cat recon/$TARGET/js/secrets.txt   # 30+ pattern hits (deduped)
+cat recon/$TARGET/js/trufflehog.json  # Verified secrets only
 ```
 
 ## GITHUB DORKING FOR TARGET
