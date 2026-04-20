@@ -71,7 +71,7 @@ if [ "$TARGET_TYPE" = "ip" ] || [ "$TARGET_TYPE" = "cidr" ]; then
     SCOPE_LOCK=1
 fi
 
-mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params}
+mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params,asn,dns,waf,graphql,screenshots,takeover,cloud,github,shodan,nuclei,exposure}
 
 # Safety net: merge partial subdomain results on early exit (watchdog kill, etc.)
 _emergency_merge_subs() {
@@ -92,6 +92,69 @@ echo "  Output: $RECON_DIR/"
 echo "  Mode: $([ "$QUICK_MODE" = "--quick" ] && echo "Quick" || echo "Full")"
 echo "  Time: $(date)"
 echo "============================================="
+echo ""
+
+# ============================================================
+# Phase 0.5: ASN / IP Range Discovery
+# ============================================================
+log_info "Phase 0.5: ASN / IP Range Discovery"
+
+if [ "$TARGET_TYPE" = "domain" ]; then
+    TARGET_IP=$(dig +short "$TARGET" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+    if [ -n "$TARGET_IP" ]; then
+        log_step "Resolved $TARGET → $TARGET_IP — querying bgpview.io for ASN/CIDRs..."
+        ASN_DATA=$(curl -s --max-time 15 "https://api.bgpview.io/ip/$TARGET_IP" 2>/dev/null || true)
+        if [ -n "$ASN_DATA" ]; then
+            echo "$ASN_DATA" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    asns = set()
+    prefixes = []
+    for peer in data.get('data', {}).get('prefixes', []):
+        asn = peer.get('asn', {}).get('asn', '')
+        prefix = peer.get('prefix', '')
+        if asn: asns.add(str(asn))
+        if prefix: prefixes.append(prefix)
+    for a in sorted(asns): print('ASN:', a)
+    for p in sorted(set(prefixes)): print('CIDR:', p)
+except: pass
+" > "$RECON_DIR/asn/asn_info.txt" 2>/dev/null || true
+            grep '^CIDR:' "$RECON_DIR/asn/asn_info.txt" 2>/dev/null \
+                | awk '{print $2}' > "$RECON_DIR/asn/cidrs.txt" 2>/dev/null || true
+
+            # Enrich via RIPE stat using detected ASN
+            ASN_NUM=$(grep '^ASN:' "$RECON_DIR/asn/asn_info.txt" 2>/dev/null | head -1 | awk '{print $2}')
+            if [ -n "$ASN_NUM" ]; then
+                log_step "Enriching via RIPE stat for AS${ASN_NUM}..."
+                curl -s --max-time 15 \
+                    "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${ASN_NUM}" 2>/dev/null \
+                    | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for p in data.get('data', {}).get('prefixes', []): print(p.get('prefix', ''))
+except: pass
+" | grep -E '^[0-9]' >> "$RECON_DIR/asn/cidrs.txt" 2>/dev/null || true
+                sort -u "$RECON_DIR/asn/cidrs.txt" -o "$RECON_DIR/asn/cidrs.txt" 2>/dev/null || true
+            fi
+            CIDR_COUNT=$(wc -l < "$RECON_DIR/asn/cidrs.txt" 2>/dev/null || echo 0)
+            if [ "$CIDR_COUNT" -gt 0 ]; then
+                log_ok "IP ranges found: $CIDR_COUNT CIDRs (AS${ASN_NUM:-?})"
+                log_step "CIDRs: $(head -5 "$RECON_DIR/asn/cidrs.txt" | tr '\n' ' ')"
+            else
+                log_warn "No CIDR data returned for $TARGET_IP"
+            fi
+        else
+            log_warn "bgpview.io returned no data — skipping ASN lookup"
+        fi
+    else
+        log_warn "Could not resolve $TARGET to IP — skipping ASN lookup"
+    fi
+else
+    log_info "IP/CIDR target — skipping ASN lookup"
+fi
+
 echo ""
 
 # ============================================================
@@ -178,6 +241,56 @@ log_ok "Total unique subdomains: $TOTAL_SUBS"
 fi  # end of domain-only subdomain enum block
 
 # ============================================================
+# Phase 1.5: DNS Record Deep Dive
+# ============================================================
+echo ""
+log_info "Phase 1.5: DNS Record Deep Dive"
+
+if [ "$TARGET_TYPE" = "domain" ]; then
+    log_step "Collecting DNS records (MX, TXT, SPF, DMARC)..."
+    dig +noall +answer MX  "$TARGET" 2>/dev/null > "$RECON_DIR/dns/mx_records.txt" || true
+    dig +noall +answer TXT "$TARGET" 2>/dev/null > "$RECON_DIR/dns/txt_records.txt" || true
+    dig +noall +answer TXT "_dmarc.$TARGET" 2>/dev/null > "$RECON_DIR/dns/dmarc.txt" || true
+
+    if grep -qi "spf" "$RECON_DIR/dns/txt_records.txt" 2>/dev/null; then
+        log_done "SPF record found"
+    else
+        log_warn "No SPF record — potential email spoofing vector"
+    fi
+    if [ -s "$RECON_DIR/dns/dmarc.txt" ]; then
+        log_done "DMARC record found"
+    else
+        log_warn "No DMARC record — email spoofing may be possible"
+    fi
+
+    # Zone transfer attempt (AXFR)
+    log_step "Attempting DNS zone transfer (AXFR)..."
+    NS_LIST=$(dig +short NS "$TARGET" 2>/dev/null | head -3 || true)
+    AXFR_SUCCESS=0
+    for ns in $NS_LIST; do
+        if dig axfr "$TARGET" @"$ns" 2>/dev/null | grep -qE "^$TARGET"; then
+            dig axfr "$TARGET" @"$ns" 2>/dev/null > "$RECON_DIR/dns/axfr_${ns%.}.txt" || true
+            log_warn "AXFR succeeded on $ns — zone transfer vulnerability!"
+            AXFR_SUCCESS=1
+        fi
+    done
+    [ "$AXFR_SUCCESS" -eq 0 ] && log_done "AXFR: all nameservers refused (expected)"
+
+    # DNS wildcard detection (filters false positives from subdomain list)
+    log_step "Checking for DNS wildcard..."
+    RANDOM_SUB="nonexistent-$(date +%s)-check.$TARGET"
+    WILDCARD_IP=$(dig +short "$RANDOM_SUB" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+    if [ -n "$WILDCARD_IP" ]; then
+        log_warn "DNS wildcard detected ($RANDOM_SUB → $WILDCARD_IP) — subdomain list may have false positives"
+        echo "$WILDCARD_IP" > "$RECON_DIR/dns/wildcard_ip.txt"
+    else
+        log_done "No DNS wildcard detected"
+    fi
+else
+    log_info "IP/CIDR target — skipping DNS deep dive"
+fi
+
+# ============================================================
 # Phase 2: HTTP Probing
 # ============================================================
 echo ""
@@ -214,6 +327,48 @@ if command -v httpx &>/dev/null && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
     log_done "401 Auth Required: $(wc -l < "$RECON_DIR/live/status_401.txt" 2>/dev/null || echo 0)"
 else
     log_warn "httpx not installed or no subdomains found — skipping"
+fi
+
+# ============================================================
+# Phase 2.5: WAF Detection
+# ============================================================
+echo ""
+log_info "Phase 2.5: WAF Detection"
+
+if [ -s "$RECON_DIR/live/urls.txt" ]; then
+    if command -v wafw00f &>/dev/null; then
+        log_step "Running wafw00f on live hosts (top 10)..."
+        head -10 "$RECON_DIR/live/urls.txt" | while IFS= read -r url; do
+            wafw00f "$url" 2>/dev/null \
+                | grep -E "(Detected|behind|is behind)" >> "$RECON_DIR/waf/wafw00f.txt" || true
+        done
+        if [ -s "$RECON_DIR/waf/wafw00f.txt" ]; then
+            log_warn "WAF detections: $(wc -l < "$RECON_DIR/waf/wafw00f.txt")"
+        else
+            log_done "No WAF detected by wafw00f"
+        fi
+    else
+        # Lightweight header-based WAF fingerprinting
+        log_step "wafw00f not installed — checking response headers for WAF signatures..."
+        head -10 "$RECON_DIR/live/urls.txt" | while IFS= read -r url; do
+            HEADERS=$(curl -sI --max-time 8 "$url" 2>/dev/null || true)
+            WAF=""
+            echo "$HEADERS" | grep -qi "cf-ray\|cloudflare" && WAF="Cloudflare"
+            echo "$HEADERS" | grep -qi "x-sucuri-id"        && WAF="Sucuri"
+            echo "$HEADERS" | grep -qi "x-fw-server"        && WAF="Fortiweb"
+            echo "$HEADERS" | grep -qi "x-iinfo\|incapsula" && WAF="Imperva/Incapsula"
+            echo "$HEADERS" | grep -qi "x-cdn.*akamai\|akamai-cache" && WAF="Akamai"
+            echo "$HEADERS" | grep -qi "server: awselb\|x-amzn-requestid" && WAF="AWS"
+            [ -n "$WAF" ] && echo "$url: $WAF" >> "$RECON_DIR/waf/detected.txt"
+        done
+        if [ -s "$RECON_DIR/waf/detected.txt" ]; then
+            log_warn "WAF detected (header-based): $(cat "$RECON_DIR/waf/detected.txt" | tr '\n' ' ')"
+        else
+            log_done "No obvious WAF headers detected"
+        fi
+    fi
+else
+    log_warn "No live hosts — skipping WAF detection"
 fi
 
 # ============================================================
@@ -279,6 +434,101 @@ if [ -s "$RECON_DIR/urls/all.txt" ]; then
     grep -iE '\.(env|config|xml|json|yaml|yml|bak|backup|old|orig|sql|db|log|txt|conf|ini|htaccess|htpasswd|git)' \
         "$RECON_DIR/urls/all.txt" > "$RECON_DIR/urls/sensitive_paths.txt" 2>/dev/null || true
     log_done "Sensitive paths: $(wc -l < "$RECON_DIR/urls/sensitive_paths.txt" 2>/dev/null || echo 0)"
+fi
+
+# ============================================================
+# Phase 4.5: Wayback Endpoint Diff (New vs Old)
+# ============================================================
+echo ""
+log_info "Phase 4.5: Wayback Endpoint Diff"
+
+if [ "$TARGET_TYPE" = "domain" ] && [ "$QUICK_MODE" != "--quick" ]; then
+    log_step "Fetching URLs from ~12 months ago for diff..."
+    DATE_12M_AGO=$(date -d "12 months ago" +%Y%m%d 2>/dev/null || date -v-12m +%Y%m%d 2>/dev/null || true)
+    DATE_6M_AGO=$(date -d "6 months ago" +%Y%m%d 2>/dev/null || date -v-6m +%Y%m%d 2>/dev/null || true)
+
+    if [ -n "$DATE_12M_AGO" ] && [ -n "$DATE_6M_AGO" ]; then
+        curl -s --max-time 30 \
+            "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=original&collapse=urlkey&from=${DATE_12M_AGO}&to=${DATE_6M_AGO}&limit=5000" \
+            2>/dev/null | sort -u > "$RECON_DIR/urls/wayback_old.txt" || true
+        OLD_COUNT=$(wc -l < "$RECON_DIR/urls/wayback_old.txt" 2>/dev/null || echo 0)
+        log_done "Old URLs (6-12m ago): $OLD_COUNT"
+
+        if [ "$OLD_COUNT" -gt 0 ] && [ -s "$RECON_DIR/urls/all.txt" ]; then
+            comm -23 \
+                <(grep '?' "$RECON_DIR/urls/all.txt" 2>/dev/null | sort -u) \
+                <(grep '?' "$RECON_DIR/urls/wayback_old.txt" 2>/dev/null | sort -u) \
+                > "$RECON_DIR/urls/new_endpoints.txt" 2>/dev/null || true
+            NEW_COUNT=$(wc -l < "$RECON_DIR/urls/new_endpoints.txt" 2>/dev/null || echo 0)
+            if [ "$NEW_COUNT" -gt 0 ]; then
+                log_warn "New endpoints (not in 12m-old snapshot): $NEW_COUNT — recently deployed, higher-priority targets"
+            else
+                log_done "No new endpoints vs 12-month-old snapshot"
+            fi
+        fi
+    else
+        log_warn "Could not compute date 12 months ago — skipping wayback diff"
+    fi
+else
+    [ "$QUICK_MODE" = "--quick" ] && log_warn "Skipping wayback diff (quick mode)"
+fi
+
+# ============================================================
+# Phase 4.6: GraphQL Schema Extraction
+# ============================================================
+echo ""
+log_info "Phase 4.6: GraphQL Schema Extraction"
+
+GRAPHQL_ENDPOINTS=""
+if [ -s "$RECON_DIR/urls/api_endpoints.txt" ]; then
+    GRAPHQL_ENDPOINTS=$(grep -iE '/graphql|/gql' "$RECON_DIR/urls/api_endpoints.txt" 2>/dev/null | sort -u || true)
+fi
+
+# Also probe common GraphQL paths on live hosts if none found yet
+if [ -z "$GRAPHQL_ENDPOINTS" ] && [ -s "$RECON_DIR/live/urls.txt" ]; then
+    GRAPHQL_ENDPOINTS=$(while IFS= read -r base; do
+        for p in /graphql /api/graphql /gql /api/gql /v1/graphql; do
+            echo "${base}${p}"
+        done
+    done < <(head -20 "$RECON_DIR/live/urls.txt"))
+fi
+
+if [ -n "$GRAPHQL_ENDPOINTS" ]; then
+    INTROSPECTION_QUERY='{"query":"{ __schema { queryType { name } mutationType { name } types { name kind fields { name args { name type { name kind ofType { name kind } } } } } } }"}'
+    echo "$GRAPHQL_ENDPOINTS" | sort -u | while IFS= read -r gql_url; do
+        RESPONSE=$(curl -s --max-time 10 -X POST "$gql_url" \
+            -H "Content-Type: application/json" \
+            -d "$INTROSPECTION_QUERY" 2>/dev/null || true)
+        if echo "$RESPONSE" | grep -q '__schema'; then
+            log_warn "GraphQL introspection ENABLED: $gql_url"
+            SAFE_NAME=$(echo "$gql_url" | sed 's|[^a-zA-Z0-9]|_|g')
+            echo "$RESPONSE" > "$RECON_DIR/graphql/schema_${SAFE_NAME}.json"
+            echo "$gql_url" >> "$RECON_DIR/graphql/introspection_enabled.txt"
+            # Extract mutations (IDOR / auth-bypass candidates)
+            echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    schema = data.get('data', {}).get('__schema', {})
+    mut_type = schema.get('mutationType') or {}
+    mut_name = mut_type.get('name', '')
+    for t in schema.get('types', []):
+        if t.get('name') == mut_name and t.get('fields'):
+            print('[MUTATIONS]')
+            for f in t['fields']: print(f'  {f[\"name\"]}')
+except: pass
+" >> "$RECON_DIR/graphql/mutations.txt" 2>/dev/null || true
+        fi
+    done
+    if [ -s "$RECON_DIR/graphql/introspection_enabled.txt" ]; then
+        log_warn "GraphQL introspection open on $(wc -l < "$RECON_DIR/graphql/introspection_enabled.txt") endpoint(s)"
+        [ -s "$RECON_DIR/graphql/mutations.txt" ] && \
+            log_step "Mutations found — review $RECON_DIR/graphql/mutations.txt for IDOR/auth bypass candidates"
+    else
+        log_done "GraphQL: endpoints not found or introspection disabled"
+    fi
+else
+    log_done "No GraphQL endpoints detected"
 fi
 
 # ============================================================
@@ -407,6 +657,30 @@ else
 fi
 
 # ============================================================
+# Phase 6.6: Screenshot Automation
+# ============================================================
+echo ""
+log_info "Phase 6.6: Screenshot Automation"
+
+if command -v gowitness &>/dev/null && [ -s "$RECON_DIR/live/urls.txt" ]; then
+    log_step "Running gowitness on live hosts..."
+    # Try v3 syntax first, fall back to v2
+    gowitness scan file -f "$RECON_DIR/live/urls.txt" \
+        --screenshot-path "$RECON_DIR/screenshots/" \
+        --disable-db 2>/dev/null || \
+    gowitness file -f "$RECON_DIR/live/urls.txt" \
+        --screenshot-path "$RECON_DIR/screenshots/" 2>/dev/null || true
+    SHOT_COUNT=$(find "$RECON_DIR/screenshots/" -name "*.png" 2>/dev/null | wc -l || echo 0)
+    if [ "$SHOT_COUNT" -gt 0 ]; then
+        log_ok "Screenshots captured: $SHOT_COUNT (review for admin panels / login pages)"
+    else
+        log_warn "gowitness ran but no screenshots generated (check if a browser is available)"
+    fi
+else
+    log_warn "gowitness not installed — skipping screenshots (install: go install github.com/sensepost/gowitness/v3@latest)"
+fi
+
+# ============================================================
 # Phase 7: Parameter Discovery
 # ============================================================
 echo ""
@@ -433,6 +707,240 @@ if [ -s "$RECON_DIR/urls/with_params.txt" ]; then
     fi
 else
     log_warn "No parameterized URLs found — skipping"
+fi
+
+# ============================================================
+# Phase 7.5: Subdomain Takeover Scanning
+# ============================================================
+echo ""
+log_info "Phase 7.5: Subdomain Takeover Scanning"
+
+if [ "$TARGET_TYPE" = "domain" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
+    # Method 1: subjack (if installed)
+    if command -v subjack &>/dev/null; then
+        log_step "Running subjack for subdomain takeover fingerprinting..."
+        subjack -w "$RECON_DIR/subdomains/all.txt" \
+            -t "$THREADS" \
+            -timeout 30 \
+            -o "$RECON_DIR/takeover/subjack.txt" \
+            -ssl 2>/dev/null || true
+        if [ -s "$RECON_DIR/takeover/subjack.txt" ]; then
+            log_warn "Takeover candidates (subjack): $(wc -l < "$RECON_DIR/takeover/subjack.txt")"
+        else
+            log_done "subjack: no takeover candidates found"
+        fi
+    fi
+
+    # Method 2: nuclei takeover templates (no extra tools needed beyond nuclei)
+    if command -v nuclei &>/dev/null && [ -s "$RECON_DIR/live/urls.txt" ]; then
+        log_step "Running nuclei takeover templates..."
+        nuclei -l "$RECON_DIR/live/urls.txt" \
+            -t takeovers/ \
+            -silent \
+            -o "$RECON_DIR/takeover/nuclei_takeover.txt" 2>/dev/null || true
+        if [ -s "$RECON_DIR/takeover/nuclei_takeover.txt" ]; then
+            log_warn "Takeover findings (nuclei): $(wc -l < "$RECON_DIR/takeover/nuclei_takeover.txt")"
+        else
+            log_done "nuclei takeovers: no findings"
+        fi
+    fi
+
+    # Method 3: Lightweight dangling CNAME check (no external tools)
+    log_step "Checking for dangling CNAMEs (top 200 subdomains)..."
+    TAKEOVER_SERVICES="github\.io|amazonaws\.com|heroku\.com|fastly\.net|azurewebsites\.net|cloudfront\.net|pantheon\.io|wpengine\.com|netlify\.app|webflow\.io|ghost\.io|surge\.sh"
+    while IFS= read -r sub; do
+        CNAME=$(dig +short CNAME "$sub" 2>/dev/null | head -1 || true)
+        if [ -n "$CNAME" ]; then
+            CNAME_IP=$(dig +short "$CNAME" 2>/dev/null | head -1 || true)
+            if [ -z "$CNAME_IP" ] && echo "$CNAME" | grep -qiE "$TAKEOVER_SERVICES"; then
+                echo "$sub → $CNAME (DANGLING)" >> "$RECON_DIR/takeover/dangling_cnames.txt"
+            fi
+        fi
+    done < <(head -200 "$RECON_DIR/subdomains/all.txt")
+    if [ -s "$RECON_DIR/takeover/dangling_cnames.txt" ]; then
+        log_warn "Dangling CNAMEs: $(wc -l < "$RECON_DIR/takeover/dangling_cnames.txt") — potential takeover!"
+    else
+        log_done "No dangling CNAMEs found in top 200 subdomains"
+    fi
+else
+    log_warn "No subdomain list or non-domain target — skipping takeover scan"
+fi
+
+# ============================================================
+# Phase 7.6: Cloud Asset Discovery
+# ============================================================
+echo ""
+log_info "Phase 7.6: Cloud Asset Discovery"
+
+ORG_NAME=$(echo "$TARGET" | sed 's/\..*//' | tr '[:upper:]' '[:lower:]' | tr -d '-')
+ORG_NAME_DASH=$(echo "$TARGET" | sed 's/\..*//' | tr '[:upper:]' '[:lower:]')
+PERMUTATIONS=(
+    "$ORG_NAME" "$ORG_NAME_DASH"
+    "${ORG_NAME}-dev"    "${ORG_NAME}-staging" "${ORG_NAME}-prod"
+    "${ORG_NAME}-backup" "${ORG_NAME}-data"    "${ORG_NAME}-assets"
+    "${ORG_NAME}-static" "${ORG_NAME}-media"   "${ORG_NAME}-uploads"
+    "${ORG_NAME}-logs"   "${ORG_NAME}-public"  "${ORG_NAME}-files"
+)
+
+log_step "Probing S3 bucket permutations..."
+for perm in "${PERMUTATIONS[@]}"; do
+    STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        "https://${perm}.s3.amazonaws.com" 2>/dev/null || echo "000")
+    if [ "$STATUS" = "200" ] || [ "$STATUS" = "403" ]; then
+        echo "S3: https://${perm}.s3.amazonaws.com [HTTP $STATUS]" >> "$RECON_DIR/cloud/buckets.txt"
+        [ "$STATUS" = "200" ] && log_warn "Public S3 bucket: https://${perm}.s3.amazonaws.com"
+    fi
+done
+
+log_step "Checking Firebase endpoints..."
+for perm in "$ORG_NAME" "$ORG_NAME_DASH"; do
+    STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        "https://${perm}.firebaseio.com/.json" 2>/dev/null || echo "000")
+    if [ "$STATUS" = "200" ]; then
+        log_warn "Firebase open database: https://${perm}.firebaseio.com/.json"
+        echo "Firebase: https://${perm}.firebaseio.com/.json [OPEN]" >> "$RECON_DIR/cloud/buckets.txt"
+    elif [ "$STATUS" = "401" ] || [ "$STATUS" = "403" ]; then
+        echo "Firebase: https://${perm}.firebaseio.com/.json [EXISTS, auth required]" >> "$RECON_DIR/cloud/buckets.txt"
+    fi
+done
+
+CLOUD_COUNT=$(wc -l < "$RECON_DIR/cloud/buckets.txt" 2>/dev/null || echo 0)
+if [ "$CLOUD_COUNT" -gt 0 ]; then
+    log_ok "Cloud assets found: $CLOUD_COUNT"
+else
+    log_done "Cloud asset discovery: no public/exposed assets found"
+fi
+
+# ============================================================
+# Phase 7.7: GitHub Dorking (Automated)
+# ============================================================
+echo ""
+log_info "Phase 7.7: GitHub Dorking"
+
+# Collect GitHub org names from earlier recon data
+GH_ORGS=""
+for f in "$RECON_DIR/live/httpx_full.txt" "$RECON_DIR/js/endpoints.txt" "$RECON_DIR/urls/all.txt"; do
+    if [ -f "$f" ]; then
+        GH_ORGS="$GH_ORGS $(grep -oE 'github\.com/[a-zA-Z0-9_-]+' "$f" 2>/dev/null \
+            | sed 's|github.com/||' | grep -v '^$' || true)"
+    fi
+done
+# Also try org name derived from domain as fallback
+DOMAIN_ORG=$(echo "$TARGET" | sed 's/\..*//')
+GH_ORGS=$(printf '%s\n%s\n' "$GH_ORGS" "$DOMAIN_ORG" | tr ' ' '\n' | grep -v '^$' | sort -u | head -5)
+
+if command -v gh &>/dev/null && [ -n "$GH_ORGS" ]; then
+    log_step "GitHub dorking with gh CLI..."
+    DORK_PATTERNS=("api_key" "password" "secret" ".env" "Authorization: Bearer" "BEGIN PRIVATE KEY" "aws_access_key")
+    for org in $GH_ORGS; do
+        log_step "Dorking org: $org"
+        mkdir -p "$RECON_DIR/github/$org"
+        for pattern in "${DORK_PATTERNS[@]}"; do
+            RESULTS=$(gh search code "$pattern" --owner "$org" \
+                --json path,repository --limit 5 2>/dev/null || true)
+            if [ -n "$RESULTS" ] && echo "$RESULTS" | grep -q '"path"'; then
+                echo "=== $pattern ===" >> "$RECON_DIR/github/$org/dorks.txt"
+                echo "$RESULTS" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for item in data:
+        print(f'  {item[\"repository\"][\"nameWithOwner\"]}: {item[\"path\"]}')
+except: pass
+" >> "$RECON_DIR/github/$org/dorks.txt" 2>/dev/null || true
+            fi
+        done
+    done
+    if find "$RECON_DIR/github" -name "dorks.txt" -size +0 &>/dev/null 2>&1; then
+        log_warn "GitHub dork hits found — review $RECON_DIR/github/ for secrets"
+    else
+        log_done "GitHub dorking: no obvious secret patterns found"
+    fi
+else
+    if ! command -v gh &>/dev/null; then
+        log_warn "gh CLI not installed — manual dork: github.com search for org:TARGET api_key password .env"
+    else
+        log_warn "No GitHub org identified — skipping GitHub dorking"
+    fi
+fi
+
+# Check for exposed .git on live hosts
+if [ -s "$RECON_DIR/live/urls.txt" ]; then
+    log_step "Checking for exposed .git directories (top 30 hosts)..."
+    while IFS= read -r url; do
+        STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${url}/.git/HEAD" 2>/dev/null || echo "000")
+        if [ "$STATUS" = "200" ]; then
+            log_warn "Exposed .git: ${url}/.git/HEAD"
+            echo "${url}/.git/HEAD" >> "$RECON_DIR/github/exposed_git.txt"
+        fi
+    done < <(head -30 "$RECON_DIR/live/urls.txt")
+    if [ -s "$RECON_DIR/github/exposed_git.txt" ]; then
+        log_warn "Exposed .git directories: $(wc -l < "$RECON_DIR/github/exposed_git.txt")"
+    else
+        log_done ".git exposure: none found"
+    fi
+fi
+
+# ============================================================
+# Phase 7.8: Shodan / Censys Integration (optional, API-key gated)
+# ============================================================
+echo ""
+log_info "Phase 7.8: Shodan / Censys Integration"
+
+if [ -n "${SHODAN_API_KEY:-}" ]; then
+    TARGET_IP=$(dig +short "$TARGET" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+    if [ -n "$TARGET_IP" ]; then
+        log_step "Querying Shodan for $TARGET_IP..."
+        curl -s --max-time 20 \
+            "https://api.shodan.io/shodan/host/$TARGET_IP?key=${SHODAN_API_KEY}" 2>/dev/null \
+            | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(f'IP: {data.get(\"ip_str\",\"\")}')
+    print(f'Org: {data.get(\"org\",\"\")} | OS: {data.get(\"os\",\"\")}')
+    print(f'Hostnames: {data.get(\"hostnames\",[])}')
+    for s in data.get('data', []):
+        banner = s.get('data','')[:80].replace('\n',' ')
+        print(f'  Port {s.get(\"port\")}/{s.get(\"transport\",\"tcp\")}: {s.get(\"product\",\"\")} {s.get(\"version\",\"\")} | {banner}')
+except: pass
+" > "$RECON_DIR/shodan/host_info.txt" 2>/dev/null || true
+
+        if [ -s "$RECON_DIR/shodan/host_info.txt" ]; then
+            log_ok "Shodan data retrieved for $TARGET_IP"
+            # Flag ports that nmap may have missed
+            grep 'Port ' "$RECON_DIR/shodan/host_info.txt" 2>/dev/null \
+                | while IFS= read -r line; do
+                    PORT=$(echo "$line" | grep -oE 'Port [0-9]+' | awk '{print $2}')
+                    if [ -n "$PORT" ] && ! grep -q "^$PORT" "$RECON_DIR/ports/open_ports.txt" 2>/dev/null; then
+                        echo "[NEW] $line" >> "$RECON_DIR/shodan/new_ports.txt"
+                    fi
+                done
+            [ -s "$RECON_DIR/shodan/new_ports.txt" ] && \
+                log_warn "Shodan found ports not in nmap scan: $(wc -l < "$RECON_DIR/shodan/new_ports.txt")"
+        fi
+    fi
+elif [ -n "${CENSYS_API_ID:-}" ] && [ -n "${CENSYS_API_SECRET:-}" ]; then
+    TARGET_IP=$(dig +short "$TARGET" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+    if [ -n "$TARGET_IP" ]; then
+        log_step "Querying Censys for $TARGET_IP..."
+        curl -s --max-time 20 \
+            --user "${CENSYS_API_ID}:${CENSYS_API_SECRET}" \
+            "https://search.censys.io/api/v2/hosts/$TARGET_IP" 2>/dev/null \
+            | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    r = data.get('result', {})
+    print(f'IP: {r.get(\"ip\",\"\")} | AS: {r.get(\"autonomous_system\",{}).get(\"name\",\"\")}')
+    for svc in r.get('services', []):
+        print(f'  Port {svc.get(\"port\")}/{svc.get(\"transport_protocol\",\"\")} — {svc.get(\"service_name\",\"\")}')
+except: pass
+" > "$RECON_DIR/shodan/censys_host.txt" 2>/dev/null || true
+        [ -s "$RECON_DIR/shodan/censys_host.txt" ] && log_ok "Censys data retrieved for $TARGET_IP"
+    fi
+else
+    log_warn "SHODAN_API_KEY / CENSYS_API_ID not set — skipping (export SHODAN_API_KEY=xxx to enable)"
 fi
 
 # ============================================================
@@ -464,6 +972,89 @@ else
     elif ! command -v sisakulint &>/dev/null; then
         log_warn "sisakulint not installed — CI/CD scan skipped"
     fi
+fi
+
+# ============================================================
+# Phase 9: Nuclei Vulnerability Scan (Tech-Aware)
+# ============================================================
+echo ""
+log_info "Phase 9: Nuclei Vulnerability Scan"
+
+if command -v nuclei &>/dev/null && [ -s "$RECON_DIR/live/urls.txt" ]; then
+    # Detect tech stack from httpx output and map to nuclei tags
+    NUCLEI_TAGS=""
+    if [ -s "$RECON_DIR/live/httpx_full.txt" ]; then
+        TECH_STACK=$(grep -oE '\[[a-zA-Z0-9,._-]+\]' "$RECON_DIR/live/httpx_full.txt" 2>/dev/null \
+            | tr -d '[]' | tr ',' '\n' | tr '[:upper:]' '[:lower:]' | sort -u || true)
+        NUCLEI_TAGS_LIST=""
+        for tech in $TECH_STACK; do
+            case "$tech" in
+                wordpress|wp)       NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,wordpress" ;;
+                drupal)             NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,drupal" ;;
+                joomla)             NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,joomla" ;;
+                spring|springboot)  NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,springboot" ;;
+                laravel)            NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,laravel" ;;
+                django)             NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,django" ;;
+                nginx)              NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,nginx" ;;
+                apache)             NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,apache" ;;
+                iis)                NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,iis" ;;
+                graphql)            NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,graphql" ;;
+                jenkins)            NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,jenkins" ;;
+                gitlab)             NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,gitlab" ;;
+                elasticsearch)      NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,elasticsearch" ;;
+                redis)              NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,redis" ;;
+                tomcat)             NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,tomcat" ;;
+                phpmyadmin)         NUCLEI_TAGS_LIST="$NUCLEI_TAGS_LIST,phpmyadmin" ;;
+            esac
+        done
+        NUCLEI_TAGS=$(echo "$NUCLEI_TAGS_LIST" | sed 's/^,//' | tr -d ' ')
+        [ -n "$NUCLEI_TAGS" ] && log_step "Tech-aware nuclei tags: $NUCLEI_TAGS"
+    fi
+
+    # Base scan: critical/high/medium across all templates
+    log_step "Running base nuclei scan (critical, high, medium)..."
+    nuclei -l "$RECON_DIR/live/urls.txt" \
+        -severity critical,high,medium \
+        -silent \
+        -o "$RECON_DIR/nuclei/base_findings.txt" 2>/dev/null || true
+    log_done "Base findings: $(wc -l < "$RECON_DIR/nuclei/base_findings.txt" 2>/dev/null || echo 0)"
+
+    # Exposure scan: admin panels, dashboards, exposed configs
+    log_step "Running nuclei exposure templates..."
+    nuclei -l "$RECON_DIR/live/urls.txt" \
+        -t exposures/ \
+        -silent \
+        -o "$RECON_DIR/nuclei/exposures.txt" 2>/dev/null || true
+    log_done "Exposure findings: $(wc -l < "$RECON_DIR/nuclei/exposures.txt" 2>/dev/null || echo 0)"
+
+    # Misconfiguration scan: CORS, security headers, etc.
+    log_step "Running nuclei misconfiguration templates..."
+    nuclei -l "$RECON_DIR/live/urls.txt" \
+        -t misconfiguration/ \
+        -silent \
+        -o "$RECON_DIR/nuclei/misconfigs.txt" 2>/dev/null || true
+    log_done "Misconfiguration findings: $(wc -l < "$RECON_DIR/nuclei/misconfigs.txt" 2>/dev/null || echo 0)"
+
+    # Tech-specific scan (only if tags were detected)
+    if [ -n "$NUCLEI_TAGS" ]; then
+        log_step "Running tech-specific nuclei scan (tags: $NUCLEI_TAGS)..."
+        nuclei -l "$RECON_DIR/live/urls.txt" \
+            -tags "$NUCLEI_TAGS" \
+            -silent \
+            -o "$RECON_DIR/nuclei/tech_specific.txt" 2>/dev/null || true
+        log_done "Tech-specific findings: $(wc -l < "$RECON_DIR/nuclei/tech_specific.txt" 2>/dev/null || echo 0)"
+    fi
+
+    # Merge all nuclei results
+    cat "$RECON_DIR/nuclei/"*.txt 2>/dev/null | sort -u > "$RECON_DIR/nuclei/all_findings.txt" || true
+    TOTAL_NUCLEI=$(wc -l < "$RECON_DIR/nuclei/all_findings.txt" 2>/dev/null || echo 0)
+    if [ "$TOTAL_NUCLEI" -gt 0 ]; then
+        log_warn "Total nuclei findings: $TOTAL_NUCLEI"
+    else
+        log_done "Nuclei: no findings"
+    fi
+else
+    log_warn "nuclei not installed or no live hosts — skipping (install: brew install nuclei)"
 fi
 
 # ============================================================
